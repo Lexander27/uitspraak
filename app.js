@@ -103,23 +103,36 @@
     if ('speechSynthesis' in window) speechSynthesis.getVoices();
   }
 
+  const hasTts = 'speechSynthesis' in window;
+  let lastCancel = 0;
+  // Alleen afbreken als er echt iets klinkt: op iOS verdwijnt een nieuwe zin
+  // soms helemaal als er vlak daarvoor zonder reden is afgebroken.
+  function cancelSpeech() {
+    if (hasTts && (speechSynthesis.speaking || speechSynthesis.pending)) { speechSynthesis.cancel(); lastCancel = Date.now(); }
+  }
+
   function stopPlayback() {
     playTok++;
     try { player.pause(); } catch (e) { /* */ }
-    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    cancelSpeech();
     if (curResolve) { const r = curResolve; curResolve = null; r(); }
     setStatus('');
   }
 
-  function playUrl(url, speed = 1) {
+  // startTimeout: als het geluid niet binnen die tijd begint (trage verbinding), geven we op.
+  function playUrl(url, speed = 1, startTimeout = 0) {
     return new Promise((res, rej) => {
-      curResolve = res;
-      player.onended = () => { curResolve = null; res(); };
-      player.onerror = () => { curResolve = null; rej(new Error('audio')); };
+      let t = null;
+      const off = () => { clearTimeout(t); player.onended = player.onerror = player.onplaying = null; curResolve = null; };
+      curResolve = () => { off(); res(); };
+      player.onended = () => { off(); res(); };
+      player.onerror = () => { off(); rej(new Error('audio')); };
+      player.onplaying = () => clearTimeout(t);
+      if (startTimeout) t = setTimeout(() => { off(); try { player.pause(); } catch (e) { /* */ } rej(new Error('traag')); }, startTimeout);
       player.src = url;
       player.defaultPlaybackRate = speed; player.playbackRate = speed;
       const p = player.play();
-      if (p) p.catch(e => { curResolve = null; rej(e); });
+      if (p) p.catch(e => { if (curResolve) { off(); rej(e); } });
     });
   }
 
@@ -129,27 +142,65 @@
   }
   function speak(text, slow) {
     return new Promise(res => {
-      if (!('speechSynthesis' in window)) { toast('Dit apparaat heeft geen spraakfunctie.'); return res(); }
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = 'nl-NL';
-      const v = nlVoice(); if (v) u.voice = v;
-      u.rate = slow ? 0.55 : 0.9;
-      let done = false;
-      const fin = () => { if (done) return; done = true; clearTimeout(t); if (curResolve === fin) curResolve = null; res(); };
-      const t = setTimeout(fin, 3500 + text.length * 300);
-      u.onend = fin; u.onerror = fin;
-      curResolve = fin; curUtter = u; // referentie bewaren, anders stopt Safari soms te vroeg
-      speechSynthesis.speak(u);
+      if (!hasTts) { toast('Dit apparaat heeft geen spraakfunctie.'); return res(); }
+      cancelSpeech();
+      let done = false, started = false, tries = 0, guard = null, watch = null, u = null;
+      const fin = () => {
+        if (done) return; done = true; clearTimeout(guard); clearTimeout(watch);
+        if (curResolve === fin) curResolve = null; res();
+      };
+      const say = () => {
+        if (done) return;
+        tries++;
+        u = new SpeechSynthesisUtterance(text);
+        u.lang = 'nl-NL';
+        const v = nlVoice(); if (v) u.voice = v;
+        u.rate = slow ? 0.55 : 0.9;
+        u.onstart = () => { started = true; };
+        u.onend = fin; u.onerror = fin;
+        curUtter = u; // referentie bewaren, anders stopt Safari soms te vroeg
+        try { speechSynthesis.resume(); } catch (e) { /* */ }
+        speechSynthesis.speak(u);
+        // Begint er niets? Dan is de zin "ingeslikt": één keer opnieuw proberen.
+        watch = setTimeout(() => {
+          if (done || started || speechSynthesis.speaking || tries >= 2) return;
+          u.onend = u.onerror = null;
+          speechSynthesis.cancel(); lastCancel = Date.now();
+          setTimeout(say, 200);
+        }, 1200);
+      };
+      guard = setTimeout(fin, 4500 + text.length * 300);
+      curResolve = fin;
+      const sinceCancel = Date.now() - lastCancel;
+      if (sinceCancel < 200) setTimeout(say, 200 - sinceCancel); else say();
     });
   }
 
   // Echte opnames van Wikimedia Commons (bestanden "Nl-woord.ogg"), anders de computerstem.
-  const pending = {};
+  // De opname wordt vooraf helemaal opgehaald en bewaard, zodat ze direct afspeelt bij een tik.
+  const pending = {}, blobUrl = {};
+  const AUDIO_CACHE = 'uitspraak-audio';
+  async function loadBlob(k, url) {
+    if (blobUrl[k] || !url) return;
+    try {
+      let res = null, cache = null;
+      if (window.caches) { cache = await caches.open(AUDIO_CACHE); res = await cache.match(url); }
+      if (!res) {
+        res = await fetch(url);
+        if (!res.ok) return;
+        if (cache) cache.put(url, res.clone()).catch(() => {});
+      }
+      blobUrl[k] = URL.createObjectURL(await res.blob());
+    } catch (e) { /* dan spelen we rechtstreeks van internet */ }
+  }
   function prefetch(word) {
     const k = norm(word);
     if (!store.settings.real || /[^a-zà-ÿ'-]/i.test(k) || !k) return Promise.resolve('');
-    if (k in refCache) return Promise.resolve(refCache[k]);
     if (pending[k]) return pending[k];
+    if (k in refCache) {
+      if (!refCache[k] || blobUrl[k]) return Promise.resolve(refCache[k]);
+      return pending[k] = loadBlob(k, refCache[k]).then(() => refCache[k]).finally(() => { delete pending[k]; });
+    }
     const url = 'https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&prop=videoinfo&viprop=derivatives&titles=' +
       encodeURIComponent('File:Nl-' + k + '.ogg');
     pending[k] = fetch(url).then(r => r.json()).then(j => {
@@ -165,16 +216,18 @@
       }
       refCache[k] = found;
       try { localStorage.setItem(REFKEY, JSON.stringify(refCache)); } catch (e) { /* */ }
-      return found;
+      return loadBlob(k, found).then(() => found);
     }).catch(() => '').finally(() => { delete pending[k]; });
     return pending[k];
   }
   const hasReal = w => !!(store.settings.real && refCache[norm(w)]);
 
   async function playRef(word, { slow = false, forceTts = false } = {}) {
+    const k = norm(word);
     if (!forceTts && hasReal(word)) {
       const tok = playTok;
-      try { await playUrl(refCache[norm(word)], slow ? 0.65 : 1); return; }
+      // lokale kopie speelt direct; anders van internet, met de computerstem als reserve
+      try { await playUrl(blobUrl[k] || refCache[k], slow ? 0.65 : 1, blobUrl[k] ? 0 : 2500); return; }
       catch (e) { if (tok !== playTok) return; }
     }
     await speak(word, slow);
@@ -208,11 +261,14 @@
       recStream.getTracks().forEach(t => t.stop());
       const k = norm(it.w);
       if (recs[k]) URL.revokeObjectURL(recs[k]);
-      recs[k] = URL.createObjectURL(new Blob(chunks, { type: rec.mimeType || 'audio/mp4' }));
+      recBlobs[k] = new Blob(chunks, { type: rec.mimeType || 'audio/mp4' });
+      recs[k] = URL.createObjectURL(recBlobs[k]);
+      delete scores[k];
       recState = 'idle';
       const still = curItem() === it;
       render();
       if (still) setTimeout(() => { if (curItem() === it) compare(); }, 350);
+      assess(it);
     };
     rec.start();
     recState = 'recording'; render();
@@ -231,6 +287,114 @@
     setStatus('Jouw opname …');
     try { await playUrl(recs[norm(it.w)]); } catch (e) { /* */ }
     if (tok === playTok) setStatus('');
+  }
+
+  // ---------- automatische score (Azure Speech, uitspraakbeoordeling) ----------
+  const recBlobs = {}, scores = {};
+  let actx = null;
+  const azOn = () => !!(store.settings.azKey && store.settings.azRegion);
+  const level = s => s >= 80 ? 'good' : s >= 60 ? 'mid' : 'bad';
+  const levelRate = { good: 'goed', mid: 'bijna', bad: 'nee' };
+
+  // Azure wil WAV, 16 kHz, mono. De telefoon neemt op in een ander formaat, dus zetten we het om.
+  async function toWav(blob) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    actx = actx || new AC();
+    const raw = await blob.arrayBuffer();
+    const buf = await new Promise((res, rej) => { const p = actx.decodeAudioData(raw, res, rej); if (p && p.catch) p.catch(rej); });
+    const n = buf.length, ch = buf.numberOfChannels, mono = new Float32Array(n);
+    for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < n; i++) mono[i] += d[i] / ch; }
+    const ratio = buf.sampleRate / 16000, m = Math.floor(n / ratio);
+    const v = new DataView(new ArrayBuffer(44 + m * 2));
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, 'RIFF'); v.setUint32(4, 36 + m * 2, true); str(8, 'WAVEfmt '); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 16000, true); v.setUint32(28, 32000, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, m * 2, true);
+    for (let i = 0; i < m; i++) {
+      const a = Math.floor(i * ratio), b = Math.min(n, Math.max(a + 1, Math.floor((i + 1) * ratio)));
+      let s = 0; for (let j = a; j < b; j++) s += mono[j];
+      s = Math.max(-1, Math.min(1, s / (b - a)));
+      v.setInt16(44 + i * 2, Math.round(s * 32767), true);
+    }
+    return new Blob([v.buffer], { type: 'audio/wav' });
+  }
+
+  function parseScore(j, ref) {
+    const pa = o => (o && o.PronunciationAssessment) || o || {};
+    const num = x => typeof x === 'number' && isFinite(x) ? Math.round(x) : null;
+    const nb = j && j.NBest && j.NBest[0];
+    if (!nb || j.RecognitionStatus !== 'Success') return { state: 'err', msg: 'Ik kon je niet goed horen. Probeer het opnieuw, iets luider.' };
+    const words = (nb.Words || []).map(w => ({
+      w: w.Word || '', score: num(pa(w).AccuracyScore), err: pa(w).ErrorType || 'None',
+      ph: (w.Phonemes || []).map(p => ({ p: p.Phoneme || '', score: num(pa(p).AccuracyScore) })).filter(p => p.score !== null)
+    }));
+    const multi = ref.trim().split(/\s+/).length > 1;
+    const acc = num(pa(nb).AccuracyScore), pron = num(pa(nb).PronScore);
+    const total = multi && pron !== null ? pron : acc;
+    if (total === null) return { state: 'err', msg: 'Er kwam geen score terug. Probeer het opnieuw.' };
+    return { state: 'done', total, multi, words, heard: (nb.Lexical || nb.Display || '').trim() };
+  }
+
+  async function assess(it) {
+    const k = norm(it.w), blob = recBlobs[k], s = store.settings;
+    if (!blob || !azOn()) return;
+    const job = scores[k] = { state: 'busy' };
+    paintScore(it);
+    let result;
+    try {
+      const wav = await toWav(blob);
+      const cfg = btoa(unescape(encodeURIComponent(JSON.stringify({
+        ReferenceText: it.w, GradingSystem: 'HundredMark', Granularity: 'Phoneme', Dimension: 'Comprehensive', EnableMiscue: 'True'
+      }))));
+      const host = s.azRegion.includes('.') ? s.azRegion + '/stt' : s.azRegion + '.stt.speech.microsoft.com';
+      const r = await fetch(`https://${host}/speech/recognition/conversation/cognitiveservices/v1?language=nl-NL&format=detailed`, {
+        method: 'POST', body: wav,
+        headers: { 'Ocp-Apim-Subscription-Key': s.azKey, 'Content-Type': 'audio/wav; codecs=audio/pcm; samplerate=16000', 'Pronunciation-Assessment': cfg, Accept: 'application/json' }
+      });
+      if (r.status === 401 || r.status === 403) result = { state: 'err', msg: 'De Azure-sleutel of de regio klopt niet. Controleer ze bij Voortgang → Instellingen.' };
+      else if (r.status === 429) result = { state: 'err', msg: 'De gratis limiet van Azure is bereikt. Probeer het later opnieuw.', retry: true };
+      else if (!r.ok) result = { state: 'err', msg: `De score is mislukt (fout ${r.status}).`, retry: true };
+      else result = parseScore(await r.json(), it.w);
+    } catch (e) {
+      result = { state: 'err', msg: 'De score is mislukt. Is er internet?', retry: true };
+    }
+    if (scores[k] !== job) return; // er is intussen een nieuwe opname gemaakt
+    scores[k] = result;
+    paintScore(it);
+  }
+
+  function scoreHtml(it) {
+    const k = norm(it.w), sc = scores[k];
+    if (!sc) return recs[k] && !azOn() ? '<p class="muted small">Automatische score staat uit. Aanzetten kan bij Voortgang → Instellingen.</p>' : '';
+    if (sc.state === 'busy') return '<div class="scorebox muted">Score berekenen …</div>';
+    if (sc.state === 'err') return `<div class="scorebox"><p class="small">${esc(sc.msg)}</p>
+      ${sc.retry ? '<button class="btn" data-act="score">Opnieuw proberen</button>' : ''}</div>`;
+    const lv = level(sc.total), label = { good: 'Goed!', mid: 'Bijna goed', bad: 'Nog niet goed' }[lv];
+    const chip = (text, s, extra = '') => `<span class="chip ${s === null ? '' : level(s)} ${extra}">${esc(text)}${s === null ? '' : ` <b>${s}</b>`}</span>`;
+    let detail = '';
+    if (sc.multi) {
+      detail = `<div class="chips">${sc.words.map(w => w.err === 'Omission' ? chip(w.w, null, 'miss') : w.err === 'Insertion' ? chip('+ ' + w.w, null, 'extra') : chip(w.w, w.score)).join('')}</div>`;
+    } else {
+      const ph = (sc.words.find(w => w.err !== 'Insertion') || { ph: [] }).ph;
+      if (ph.length > 1) detail = `<div class="small muted">Per klank, van begin tot eind:</div>
+        <div class="chips">${ph.map((p, i) => chip(p.p || String(i + 1), p.score)).join('')}</div>`;
+    }
+    const heard = sc.heard && norm(sc.heard).replace(/[.,!?]/g, '') !== norm(it.w).replace(/[.,!?]/g, '')
+      ? `<p class="small">De computer hoorde: <b>“${esc(sc.heard)}”</b></p>` : '';
+    const snd = SOUNDS.find(s => s.id === it.sound);
+    const tip = lv !== 'good' && snd ? `<p class="small muted">Deze les gaat over <b>${esc(snd.label)}</b>: ${esc(snd.tip)}</p>` : '';
+    return `<div class="scorebox">
+      <div class="scorenum ${lv}">${sc.total}<span>/100</span></div>
+      <div class="scorelbl ${lv}">${label}</div>
+      ${detail}${heard}${tip}
+      <p class="muted tiny">De score komt van een computer en kan zich vergissen. Vertrouw ook op je oren.</p></div>`;
+  }
+  const suggested = it => { const sc = scores[norm(it.w)]; return sc && sc.state === 'done' ? levelRate[level(sc.total)] : ''; };
+  function paintScore(it) {
+    if (curItem() !== it) return;
+    const el = $('#score'); if (el) el.innerHTML = scoreHtml(it);
+    const sug = suggested(it);
+    document.querySelectorAll('[data-act="rate"]').forEach(b => b.classList.toggle('sug', b.dataset.r === sug));
   }
 
   // ---------- navigatie ----------
@@ -280,6 +444,8 @@
     const it = v.items[v.idx], k = norm(it.w), has = !!recs[k];
     const recOn = recState === 'recording', recWait = recState === 'starting';
     prefetch(it.w).then(() => { if (curItem() === it) { const el = $('#src'); if (el) el.textContent = srcLabel(it.w); } });
+    if (v.items[v.idx + 1]) prefetch(v.items[v.idx + 1].w); // het volgende woord alvast klaarzetten
+    const sug = suggested(it);
     const nav = v.session ? '' : `<div class="row">
         <button class="btn" data-act="prev" ${v.idx === 0 ? 'disabled' : ''}>‹ Vorige</button>
         <button class="btn" data-act="next" ${v.idx >= v.items.length - 1 ? 'disabled' : ''}>Volgende ›</button></div>`;
@@ -300,13 +466,14 @@
           <button class="btn soft" data-act="compare" ${has ? '' : 'disabled'}>Vergelijk</button>
         </div>
         <div class="status" id="status"></div>
+        <div id="score">${scoreHtml(it)}</div>
       </div>
       <div class="card rate">
         <div class="center small muted">Hoe klonk het?</div>
         <div class="row">
-          <button class="btn no" data-act="rate" data-r="nee">Nog niet</button>
-          <button class="btn mid" data-act="rate" data-r="bijna">Bijna</button>
-          <button class="btn yes" data-act="rate" data-r="goed">Goed</button>
+          <button class="btn no ${sug === 'nee' ? 'sug' : ''}" data-act="rate" data-r="nee">Nog niet</button>
+          <button class="btn mid ${sug === 'bijna' ? 'sug' : ''}" data-act="rate" data-r="bijna">Bijna</button>
+          <button class="btn yes ${sug === 'goed' ? 'sug' : ''}" data-act="rate" data-r="goed">Goed</button>
         </div>
       </div>${nav}`];
   }
@@ -432,6 +599,19 @@
         <p class="muted small">${voice ? 'Computerstem: ' + esc(voice.name) : 'Geen Nederlandse computerstem gevonden op dit apparaat.'}</p>
         <button class="btn danger" data-act="reset" style="margin-top:8px">Alle voortgang wissen</button>
       </div>
+      <h2>Automatische score</h2>
+      <div class="card">
+        <p class="small">${azOn() ? '<b>Staat aan.</b> Na elke opname krijg je een score.' : '<b>Staat uit.</b> Vul een regio en een sleutel van Azure Speech in om na elke opname een score te krijgen.'}</p>
+        <p class="muted small">Je opname gaat dan naar Microsoft om te worden beoordeeld. De sleutel blijft alleen op dit apparaat.</p>
+        <form id="azform" autocomplete="off">
+          <label class="field"><span>Regio (bijvoorbeeld westeurope)</span>
+            <input type="text" name="region" value="${esc(store.settings.azRegion || '')}" maxlength="120" autocapitalize="off" autocorrect="off" spellcheck="false" required></label>
+          <label class="field"><span>Sleutel</span>
+            <input type="password" name="key" maxlength="200" autocomplete="off" placeholder="${store.settings.azKey ? 'Opgeslagen. Vul in om te vervangen.' : ''}" ${store.settings.azKey ? '' : 'required'}></label>
+          <button class="btn primary" type="submit">Opslaan</button>
+        </form>
+        ${store.settings.azKey ? '<button class="btn danger" data-act="az-clear" style="margin-top:10px">Sleutel verwijderen</button>' : ''}
+      </div>
       <p class="muted small center">Opnames: Wikimedia Commons, vrije licenties (CC BY-SA e.a.). Jouw eigen opnames blijven op dit apparaat.</p>`];
   }
 
@@ -476,6 +656,10 @@
     rec: toggleRec,
     mine: () => { const u = recs[norm(curItem().w)]; if (u) { stopPlayback(); playUrl(u).catch(() => {}); } },
     compare,
+    score: () => assess(curItem()),
+    'az-clear': () => {
+      if (confirm('De Azure-sleutel verwijderen? De automatische score gaat dan uit.')) { delete store.settings.azKey; save(); render(); }
+    },
     prev: () => step(-1), next: () => step(1),
     rate: d => {
       const v = view, it = v.items[v.idx];
@@ -521,6 +705,16 @@
     const fn = ACT[el.dataset.act]; if (fn) fn(el.dataset);
   });
   document.addEventListener('submit', e => {
+    if (e.target.id === 'azform') {
+      e.preventDefault();
+      const region = e.target.region.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+      const key = e.target.key.value.trim();
+      if (!/^[a-z0-9][a-z0-9.-]*$/.test(region)) { toast('De regio klopt niet. Voorbeeld: westeurope'); return; }
+      store.settings.azRegion = region;
+      if (key) store.settings.azKey = key;
+      save(); render(); toast('Opgeslagen.');
+      return;
+    }
     if (e.target.id !== 'addform') return;
     e.preventDefault();
     const w = e.target.w.value.trim().replace(/\s+/g, ' '), uk = e.target.uk.value.trim();
@@ -535,9 +729,16 @@
   document.addEventListener('visibilitychange', () => { if (document.hidden) leave(); });
   if ('speechSynthesis' in window) speechSynthesis.onvoiceschanged = () => { if (view.name === 'voortgang') render(); };
 
-  if ('serviceWorker' in navigator && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
-  }
+  const isLocal = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  if ('serviceWorker' in navigator && !isLocal) navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Alleen tijdens het ontwikkelen: een opname aanleveren zonder microfoon, om de score te testen.
+  if (isLocal) window.__test = {
+    setRec(blob) {
+      const it = curItem(), k = norm(it.w);
+      recBlobs[k] = blob; recs[k] = URL.createObjectURL(blob); delete scores[k];
+      render(); return assess(it);
+    }
+  };
 
   render();
 })();

@@ -149,6 +149,27 @@ p:last-child { margin-bottom: 0; }
 .rate .mid { color: var(--warn); }
 .rate .yes { color: var(--ok); }
 
+/* automatische score */
+.scorebox { border-top: 1px dashed var(--line); margin-top: 6px; padding-top: 14px; }
+.scorebox p { margin: 10px 0 0; }
+.scorenum { font-size: 52px; font-weight: 800; line-height: 1; }
+.scorenum span { font-size: 18px; font-weight: 600; color: var(--muted); }
+.scorelbl { font-weight: 700; margin: 2px 0 10px; }
+.good { color: var(--ok); }
+.mid { color: var(--warn); }
+.bad { color: var(--bad); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 6px; }
+.chip { border: 1px solid var(--line); border-radius: 10px; padding: 4px 9px; font-size: 15px; color: var(--text); }
+.chip b { font-size: 13px; }
+.chip.good { border-color: var(--ok); background: var(--ok-soft); }
+.chip.mid { border-color: var(--warn); }
+.chip.bad { border-color: var(--bad); background: var(--bad-soft); }
+.chip.good b { color: var(--ok); } .chip.mid b { color: var(--warn); } .chip.bad b { color: var(--bad); }
+.chip.miss { text-decoration: line-through; color: var(--bad); border-color: var(--bad); }
+.chip.extra { color: var(--muted); border-style: dashed; }
+.tiny { font-size: 12.5px; }
+.rate .btn.sug { border: 2px solid currentColor; }
+
 .tip { border-left: 4px solid var(--accent); }
 .tipuk { color: var(--muted); font-size: 15.5px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
 
@@ -167,7 +188,7 @@ p:last-child { margin-bottom: 0; }
 /* formulier */
 .field { display: block; margin-bottom: 10px; }
 .field span { display: block; font-size: 14px; color: var(--muted); margin-bottom: 4px; }
-input[type=text] {
+input[type=text], input[type=password] {
   width: 100%; min-height: 48px; padding: 10px 12px; border-radius: 12px;
   border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit;
 }
